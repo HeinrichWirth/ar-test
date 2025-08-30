@@ -1,0 +1,422 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1, user-scalable=no"/>
+<title>AR MVP — Диагностика + OBJ импорт (v3)</title>
+<style>
+  html,body{margin:0;height:100%;overflow:hidden;background:#000;font-family:system-ui,Arial;}
+  .webgl{position:fixed; inset:0; z-index:0; display:block;}
+  /* Нижняя панель: без blur, плотный фон, наверху по слоям */
+  #ui{position:fixed;left:0;right:0;bottom:0;padding:10px;display:flex;gap:8px;flex-wrap:wrap;justify-content:center;
+      background:rgba(0,0,0,.8); z-index:1000;}
+  #ui button,#ui input{font-size:14px;padding:10px 12px;border-radius:10px;border:0}
+  #ui button{background:#fff; cursor:pointer;}
+  #toast{position:fixed;top:12px;left:50%;transform:translateX(-50%);background:rgba(0,0,0,.85);color:#fff;
+         padding:8px 12px;border-radius:10px;font-size:14px;display:none; z-index:1000;}
+  #hint{position:fixed;top:52px;left:50%;transform:translateX(-50%);background:rgba(20,20,20,.9);color:#fff;
+        padding:6px 10px;border-radius:8px;font-size:13px; z-index:1000;}
+  #status{position:fixed;top:0;left:0;right:0;background:#111;color:#9cf;padding:6px 10px;font-size:12px;white-space:pre-wrap;z-index:1000;}
+  #fallback{position:fixed;right:8px;top:120px;background:rgba(255,255,255,.98);color:#000;padding:10px;border-radius:10px;z-index:900;width:300px;display:none;box-shadow:0 8px 24px rgba(0,0,0,.25)}
+  #fallback h3{margin:0 0 8px 0;font-size:14px}
+  #camtest{position:fixed;left:8px;top:120px;background:rgba(255,255,255,.98);color:#000;padding:10px 10px 14px;border-radius:10px;z-index:900;width:300px;box-shadow:0 8px 24px rgba(0,0,0,.25);}
+  #camtest video{width:100%;background:#000}
+  #camtest .close{position:absolute; top:6px; right:8px; width:28px; height:28px; border-radius:50%;
+                  background:#000; color:#fff; border:none; cursor:pointer; font-size:18px; line-height:28px; text-align:center;}
+  .small{font-size:12px; opacity:.85}
+</style>
+</head>
+<body>
+<div id="status">Проверка окружения…</div>
+<div id="toast"></div>
+<div id="hint">Нажми «Запустить AR». Нужен <b>HTTPS</b> + Android Chrome + Google Play Services for AR.</div>
+
+<div id="camtest">
+  <button class="close" id="btnCamClose">×</button>
+  <b>Тест камеры</b><br/>
+  <button id="btnCam">Включить камеру</button>
+  <small id="camMsg" class="small"></small>
+  <video id="vid" playsinline muted></video>
+</div>
+
+<div id="fallback">
+  <h3>Fallback: AR через Scene Viewer</h3>
+  <small class="small">Если WebXR не стартует — проверь здесь.</small>
+  <div style="margin-top:8px">
+    <input id="mvUrl" placeholder="URL .glb (по HTTPS)" size="28" value="https://modelviewer.dev/shared-assets/models/Astronaut.glb"/>
+  </div>
+  <div style="margin-top:6px">
+    <model-viewer id="mv" src="https://modelviewer.dev/shared-assets/models/Astronaut.glb"
+      ar ar-modes="scene-viewer webxr"
+      camera-controls
+      exposure="1" environment-image="neutral"
+      style="width:100%;height:260px;background:#eee;border-radius:10px;overflow:hidden">
+    </model-viewer>
+  </div>
+  <div style="margin-top:6px;display:flex;gap:8px;flex-wrap:wrap">
+    <button id="btnApply">Применить URL</button>
+    <button id="btnOpenAR">В AR</button>
+  </div>
+  <small class="small">Если кнопка «В AR» не активна — девайс не поддерживает Scene Viewer.</small>
+</div>
+
+<div id="ui">
+  <button id="start">Запустить AR</button>
+  <button id="calib">Калибровка A4</button>
+  <button id="placeBox">Поставить коробку</button>
+  <input id="modelUrl" placeholder="URL .glb (необязательно)" size="20"/>
+  <button id="placeModel">Поставить GLB</button>
+  <!-- Ясная и видимая кнопка импорта OBJ в главной панели -->
+  <button id="btnImportOBJ">Импорт OBJ</button>
+  <input type="file" id="fileOBJmain" accept=".obj" style="display:none"/>
+  <button id="placeOBJ">Разместить OBJ</button>
+  <button id="reset">Сброс масштаба</button>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/three@0.160/build/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.160/examples/js/loaders/GLTFLoader.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.160/examples/js/loaders/OBJLoader.js"></script>
+<script type="module" src="https://unpkg.com/@google/model-viewer/dist/model-viewer.min.js"></script>
+
+<script>
+(async function(){
+  const status = document.getElementById('status');
+  const toastBox = document.getElementById('toast');
+  const hint = document.getElementById('hint');
+  const setStatus = (txt)=>{ status.textContent = txt; };
+  const toast = (msg, ms=2200)=>{ toastBox.textContent=msg; toastBox.style.display='block'; clearTimeout(toastBox._t); toastBox._t=setTimeout(()=>toastBox.style.display='none', ms); };
+  const setHint = (msg)=>{ hint.innerHTML = msg; };
+
+  // --- Environment check ---
+  const lines = [];
+  lines.push(`URL: ${location.href}`);
+  lines.push(`Protocol: ${location.protocol}`);
+  lines.push(`UserAgent: ${navigator.userAgent}`);
+  lines.push(`navigator.xr: ${!!navigator.xr}`);
+  let arSupported = 'unknown';
+  if (navigator.xr && navigator.xr.isSessionSupported){
+    try{ arSupported = await navigator.xr.isSessionSupported('immersive-ar'); }
+    catch(e){ arSupported = `error: ${e.name}`; }
+  }
+  lines.push(`immersive-ar supported: ${arSupported}`);
+  lines.push(`HTTPS required: ${location.protocol==='https:' || location.hostname==='localhost' ? 'ok' : 'NOT OK'}`);
+  setStatus(lines.join('\\n'));
+
+  // Show fallback card if AR not supported
+  const fallbackCard = document.getElementById('fallback');
+  if (!navigator.xr || arSupported !== true) fallbackCard.style.display = 'block';
+
+  // --- Camera test ---
+  const camPanel = document.getElementById('camtest');
+  document.getElementById('btnCamClose').onclick = ()=>{ camPanel.style.display='none'; };
+  const btnCam = document.getElementById('btnCam');
+  const camMsg = document.getElementById('camMsg');
+  const vid = document.getElementById('vid');
+  btnCam.onclick = async () => {
+    camMsg.textContent = '';
+    try{
+      const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' }, audio:false });
+      vid.srcObject = stream;
+      await vid.play();
+      camMsg.textContent = 'Камера работает (это не AR, просто проверка разрешения).';
+    }catch(e){
+      camMsg.textContent = `Ошибка камеры: ${e.name} ${e.message}. Разреши доступ в настройках сайта.`;
+    }
+  };
+
+  // --- model-viewer fallback controls ---
+  const mv = document.getElementById('mv');
+  const mvUrl = document.getElementById('mvUrl');
+  document.getElementById('btnApply').onclick = ()=>{ mv.src = mvUrl.value.trim(); };
+  document.getElementById('btnOpenAR').onclick = ()=>{ mv.activateAR(); };
+
+  // ---- Scale memory ----
+  const SCALE_KEY = 'ar_mvp_scale';
+  const getScale = () => parseFloat(localStorage.getItem(SCALE_KEY) || '1') || 1;
+  const setScale = (v) => { localStorage.setItem(SCALE_KEY, String(Math.max(1e-4, v))); toast(`Масштаб сохранён: ${Number(v).toFixed(3)}`); };
+
+  // ---- UI refs ----
+  const btnStart = document.getElementById('start');
+  const btnCalib = document.getElementById('calib');
+  const btnPlaceBox = document.getElementById('placeBox');
+  const btnPlaceModel = document.getElementById('placeModel');
+  const btnImportOBJ = document.getElementById('btnImportOBJ');
+  const fileOBJmain = document.getElementById('fileOBJmain');
+  const btnPlaceOBJ = document.getElementById('placeOBJ');
+  const btnReset = document.getElementById('reset');
+  const inpUrl = document.getElementById('modelUrl');
+
+  // ---- OBJ buffer ----
+  let objBufferText = null; // содержимое выбранного OBJ
+  btnImportOBJ.onclick = ()=> fileOBJmain.click();
+  fileOBJmain.onchange = async (e)=>{
+    const f = e.target.files && e.target.files[0];
+    if (!f){ toast('Файл не выбран'); return; }
+    if (!f.name.toLowerCase().endsWith('.obj')){ toast('Выбери .obj'); return; }
+    const reader = new FileReader();
+    reader.onload = ()=>{
+      objBufferText = reader.result;
+      toast('OBJ загружен. Нажми «Разместить OBJ», затем тап по плоскости.');
+    };
+    reader.onerror = ()=> toast('Не удалось прочитать файл OBJ');
+    reader.readAsText(f);
+  };
+
+  // ---- THREE setup ----
+  const scene = new THREE.Scene();
+  const camera = new THREE.PerspectiveCamera();
+  const renderer = new THREE.WebGLRenderer({antialias:true, alpha:true});
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.setPixelRatio(Math.min(2, window.devicePixelRatio||1));
+  renderer.xr.enabled = true;
+  renderer.domElement.className = 'webgl';
+  document.body.insertBefore(renderer.domElement, document.body.firstChild);
+
+  const light = new THREE.HemisphereLight(0xffffff, 0x444444, 1.0);
+  scene.add(light);
+  const dir = new THREE.DirectionalLight(0xffffff, 0.6);
+  dir.position.set(1,2,1);
+  scene.add(dir);
+
+  const reticle = new THREE.Mesh(
+    new THREE.RingGeometry(0.06, 0.065, 48).rotateX(-Math.PI/2),
+    new THREE.MeshBasicMaterial({color:0x00ffcc, transparent:true, opacity:0.9})
+  );
+  reticle.matrixAutoUpdate = false;
+  reticle.visible = false;
+  scene.add(reticle);
+
+  const a4Mesh = new THREE.Mesh(
+    new THREE.PlaneGeometry(0.297, 0.210),
+    new THREE.MeshBasicMaterial({color:0xff0000, transparent:true, opacity:0.2})
+  );
+  a4Mesh.rotation.x = -Math.PI/2;
+  a4Mesh.visible = false;
+  scene.add(a4Mesh);
+
+  // ---- State ----
+  let xrSession = null, refSpace = null, hitTestSource = null;
+  let mode = 'idle';
+  let placeType = 'box'; // 'box' | 'glb' | 'obj'
+  let calibP1 = null, calibP2 = null;
+  let lastPlaced = null;
+
+  // ---- Start AR ----
+  btnStart.onclick = async () => {
+    if (!navigator.xr){ toast('WebXR не поддерживается этим браузером'); return; }
+    try{
+      const supported = await navigator.xr.isSessionSupported('immersive-ar');
+      if (!supported){ toast('Этот девайс/браузер не поддерживает AR (WebXR). Используй fallback справа.'); return; }
+    }catch(e){
+      console.warn(e);
+    }
+    try{
+      xrSession = await navigator.xr.requestSession('immersive-ar', {
+        requiredFeatures: ['hit-test','local-floor'],
+        optionalFeatures: ['anchors','dom-overlay'],
+        domOverlay: { root: document.body }
+      });
+    } catch(e){
+      console.error('requestSession error', e);
+      toast(`AR не стартовал: ${e.name || 'Error'} — ${e.message || ''}. Проверь: HTTPS, Chrome, камера, ARCore.`);
+      setStatus(status.textContent + `\nrequestSession error: ${e.name} ${e.message}`);
+      return;
+    }
+
+    renderer.xr.setSession(xrSession);
+    refSpace = await xrSession.requestReferenceSpace('local-floor');
+    const viewerSpace = await xrSession.requestReferenceSpace('viewer');
+    hitTestSource = await xrSession.requestHitTestSource({ space: viewerSpace });
+
+    setHint(`AR запущен. Масштаб: ${getScale().toFixed(3)}. Калибр any time.`);
+    mode = 'idle';
+
+    xrSession.addEventListener('end', ()=>{ reticle.visible=false; a4Mesh.visible=false; mode='idle'; setHint('Сессия завершена'); });
+
+    renderer.domElement.addEventListener('touchstart', (e)=>{
+      if (e.touches.length>1) return;
+      if (!reticle.visible) return;
+      const pos = new THREE.Vector3().setFromMatrixPosition(reticle.matrix);
+      if (mode==='calib'){
+        if (!calibP1){ calibP1 = pos.clone(); toast('Первая точка принята. Поставь вторую вдоль длинной стороны A4.'); }
+        else if (!calibP2){ calibP2 = pos.clone(); finishCalibration(); }
+      } else if (mode==='place'){
+        handlePlaceTapAt(pos);
+      }
+    }, {passive:true});
+
+    renderer.setAnimationLoop(onXRFrame);
+  };
+
+  // ---- Calibration ----
+  btnCalib.onclick = () => {
+    if (!xrSession) { toast('Сначала запусти AR'); return; }
+    mode = 'calib';
+    calibP1 = calibP2 = null;
+    a4Mesh.visible = true;
+    setHint('Калибровка: ткни 2 точки вдоль длинной стороны A4 (297 мм).');
+  };
+
+  function finishCalibration(){
+    const A4_LONG = 0.297; // м
+    const measured = calibP1.distanceTo(calibP2);
+    if (measured < 1e-4){ toast('Слишком маленькая дистанция'); return; }
+    const scale = A4_LONG / measured;
+    setScale(scale);
+    mode = 'idle';
+    a4Mesh.visible = false;
+    setHint(`Готово. Масштаб: ${scale.toFixed(3)}. Теперь ставь объекты.`);
+  }
+
+  // ---- Place: Box ----
+  btnPlaceBox.onclick = () => {
+    if (!xrSession) { toast('Сначала запусти AR'); return; }
+    placeType = 'box';
+    mode = 'place';
+    setHint('Тап по плоскости — поставить/перенести коробку.');
+  };
+
+  // ---- Place: GLB from URL ----
+  const gltfLoader = new THREE.GLTFLoader();
+  btnPlaceModel.onclick = async () => {
+    if (!xrSession) { toast('Сначала запусти AR'); return; }
+    placeType = 'glb';
+    mode = 'place';
+    const url = (inpUrl.value||'').trim();
+    if (!url){ toast('Укажи URL .glb'); return; }
+    setHint('Загружаю GLB…');
+    try{
+      const gltf = await new Promise((res,rej)=>gltfLoader.load(url, res, undefined, rej));
+      const root = gltf.scene;
+      root.userData.kind = 'model';
+      root.traverse(o=>{ if (o.isMesh){ o.castShadow = o.receiveShadow = true; }});
+      if (lastPlaced) scene.remove(lastPlaced);
+      lastPlaced = root;
+      lastPlaced.visible = false; // покажем при первом тапе
+      scene.add(lastPlaced);
+      toast('GLB загружен. Ткни по плоскости.');
+      setHint('Тап по плоскости — поставить/перенести модель.');
+    }catch(e){
+      console.error(e);
+      toast('Не удалось загрузить GLB. Проверь URL (CORS/HTTPS).');
+      setHint('Ошибка загрузки модели. Попробуй другой URL.');
+    }
+  };
+
+  // ---- Place: OBJ from local file ----
+  btnPlaceOBJ.onclick = async () => {
+    if (!xrSession) { toast('Сначала запусти AR'); return; }
+    if (!objBufferText){ toast('Сначала нажми «Импорт OBJ» и выбери .obj'); return; }
+    placeType = 'obj';
+    mode = 'place';
+    setHint('Готовлю OBJ…');
+    try{
+      const loader = new THREE.OBJLoader();
+      const obj = loader.parse(objBufferText);
+      obj.traverse(o=>{
+        if (o.isMesh){
+          if (!o.material) o.material = new THREE.MeshStandardMaterial({color:0xcccccc, metalness:0.0, roughness:0.9});
+          o.castShadow = o.receiveShadow = true;
+        }
+      });
+      // Центрирование по основанию
+      const box = new THREE.Box3().setFromObject(obj);
+      const size = new THREE.Vector3(); box.getSize(size);
+      const center = new THREE.Vector3(); box.getCenter(center);
+      obj.position.sub(center);
+      obj.position.y += size.y/2;
+
+      if (lastPlaced) scene.remove(lastPlaced);
+      lastPlaced = obj;
+      lastPlaced.userData.kind = 'model';
+      lastPlaced.visible = false;
+      scene.add(lastPlaced);
+      toast('OBJ готов. Ткни по плоскости.');
+      setHint('Тап по плоскости — поставить/перенести модель.');
+    }catch(e){
+      console.error(e);
+      toast('Ошибка парсинга OBJ');
+      setHint('Не удалось распарсить OBJ. Проверь файл.');
+    }
+  };
+
+  function handlePlaceTapAt(pos){
+    const scale = getScale();
+    if (placeType === 'box'){
+      if (!lastPlaced || lastPlaced.userData.kind !== 'box'){
+        const box = new THREE.Mesh(
+          new THREE.BoxGeometry(1,1,1),
+          new THREE.MeshStandardMaterial({color:0x3399ff, metalness:0.1, roughness:0.7})
+        );
+        box.userData.kind = 'box';
+        box.castShadow = box.receiveShadow = true;
+        scene.add(box);
+        lastPlaced = box;
+      }
+      lastPlaced.position.copy(pos);
+      lastPlaced.scale.setScalar(scale);
+      lastPlaced.visible = true;
+    } else {
+      if (!lastPlaced || lastPlaced.userData.kind !== 'model'){
+        toast('Сначала загрузите модель (GLB/OBJ).');
+        return;
+      }
+      lastPlaced.position.copy(pos);
+      lastPlaced.scale.setScalar(scale);
+      lastPlaced.visible = true;
+    }
+  }
+
+  function onXRFrame(t, frame){
+    const session = renderer.xr.getSession();
+    if (!session || !frame) { renderer.render(scene,camera); return; }
+    const results = hitTestSource ? frame.getHitTestResults(hitTestSource) : [];
+    if (results.length){
+      const pose = results[0].getPose(session.requestReferenceSpace ? (renderer.xr.getReferenceSpace()||'local-floor') : (renderer.xr.getReferenceSpace()));
+      // В некоторых сборках выше строка может не сработать; оставим стандартный путь ниже:
+    }
+    // стандартный
+    if (hitTestSource){
+      const results2 = frame.getHitTestResults(hitTestSource);
+      if (results2.length){
+        const pose2 = results2[0].getPose(awaitRefSpace()); // хак ниже
+        reticle.visible = true;
+        reticle.matrix.fromArray(pose2.transform.matrix);
+        if (a4Mesh.visible){
+          a4Mesh.position.setFromMatrixPosition(reticle.matrix);
+        }
+      } else {
+        reticle.visible = false;
+      }
+    }
+    renderer.render(scene,camera);
+  }
+
+  // маленький помощник для refSpace (без await тут нельзя, так что кешируем)
+  let _refSpacePromise = null;
+  function awaitRefSpace(){
+    if (_refSpacePromise) return _refSpacePromise;
+    _refSpacePromise = (async ()=>{
+      // renderer.xr.getSession уже создан; попросим ещё раз ссылочное пространство
+      try{
+        return await (renderer.xr.getSession()).requestReferenceSpace('local-floor');
+      }catch(e){
+        return await (renderer.xr.getSession()).requestReferenceSpace('viewer');
+      }
+    })();
+    return _refSpacePromise;
+  }
+
+  window.addEventListener('resize', ()=>{
+    renderer.setSize(window.innerWidth, window.innerHeight);
+  });
+
+  btnReset.onclick = () => {
+    setScale(1);
+    toast('Масштаб сброшен');
+    setHint('Масштаб 1.000. Можешь перекалибровать.');
+  };
+})();
+</script>
+</body>
+</html>
