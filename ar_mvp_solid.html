@@ -1,0 +1,248 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1, user-scalable=no"/>
+<title>AR MVP — Solid (A4 calib + Box + OBJ)</title>
+<style>
+  html,body{margin:0;height:100%;overflow:hidden;background:#000;font-family:system-ui,Arial;}
+  .webgl{position:fixed; inset:0; z-index:0; display:block;}
+  #ui{position:fixed;left:0;right:0;bottom:0;padding:10px;display:flex;gap:8px;flex-wrap:wrap;justify-content:center;
+      background:rgba(0,0,0,.9); z-index:1000;}
+  #ui button,#ui input{font-size:14px;padding:10px 12px;border-radius:10px;border:0}
+  #ui button{background:#fff; cursor:pointer;}
+  #toast{position:fixed;top:12px;left:50%;transform:translateX(-50%);background:rgba(0,0,0,.85);color:#fff;
+         padding:8px 12px;border-radius:10px;font-size:14px;display:none; z-index:1000;}
+  #hint{position:fixed;top:52px;left:50%;transform:translateX(-50%);background:rgba(20,20,20,.9);color:#fff;
+        padding:6px 10px;border-radius:8px;font-size:13px; z-index:1000;}
+</style>
+</head>
+<body>
+<div id="toast"></div>
+<div id="hint">1) Запусти AR  2) (Опц.) откалибруй A4  3) Поставь коробку или импортируй OBJ.</div>
+
+<div id="ui">
+  <button id="start">Запустить AR</button>
+  <button id="calib">Калибровка A4</button>
+  <button id="placeBox">Поставить коробку</button>
+  <button id="btnImportOBJ">Импорт OBJ</button>
+  <input type="file" id="fileOBJ" accept=".obj" style="display:none"/>
+  <button id="placeOBJ">Разместить OBJ</button>
+  <button id="reset">Сброс масштаба</button>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/three@0.160/build/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.160/examples/js/loaders/OBJLoader.js"></script>
+
+<script>
+(async function(){
+  // ---------- helpers ----------
+  const toastBox = document.getElementById('toast');
+  const hint = document.getElementById('hint');
+  const toast = (msg, ms=2000)=>{ toastBox.textContent=msg; toastBox.style.display='block'; clearTimeout(toastBox._t); toastBox._t=setTimeout(()=>toastBox.style.display='none', ms); };
+  const setHint = (msg)=>{ hint.textContent = msg; };
+
+  // ---------- persistent scale ----------
+  const SCALE_KEY='ar_solid_scale';
+  const getScale=()=> parseFloat(localStorage.getItem(SCALE_KEY)||'1')||1;
+  const setScale=(v)=>{ localStorage.setItem(SCALE_KEY, String(Math.max(1e-4,v))); toast('Масштаб: '+Number(v).toFixed(3)); };
+
+  // ---------- UI refs ----------
+  const btnStart = document.getElementById('start');
+  const btnCalib = document.getElementById('calib');
+  const btnPlaceBox = document.getElementById('placeBox');
+  const btnImportOBJ = document.getElementById('btnImportOBJ');
+  const fileOBJ = document.getElementById('fileOBJ');
+  const btnPlaceOBJ = document.getElementById('placeOBJ');
+  const btnReset = document.getElementById('reset');
+
+  // ---------- three.js ----------
+  const scene = new THREE.Scene();
+  const camera = new THREE.PerspectiveCamera();
+  const renderer = new THREE.WebGLRenderer({antialias:true, alpha:true});
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.setPixelRatio(Math.min(2, window.devicePixelRatio||1));
+  renderer.xr.enabled = true;
+  renderer.domElement.className='webgl';
+  document.body.insertBefore(renderer.domElement, document.body.firstChild);
+
+  // lights
+  scene.add(new THREE.HemisphereLight(0xffffff, 0x444444, 1.0));
+  const d = new THREE.DirectionalLight(0xffffff, 0.6);
+  d.position.set(1,2,1); scene.add(d);
+
+  // reticle
+  const reticle = new THREE.Mesh(
+    new THREE.RingGeometry(0.06,0.065,48).rotateX(-Math.PI/2),
+    new THREE.MeshBasicMaterial({color:0x00ffcc, transparent:true, opacity:0.9})
+  );
+  reticle.matrixAutoUpdate=false; reticle.visible=false; scene.add(reticle);
+
+  // A4 helper
+  const a4 = new THREE.Mesh(
+    new THREE.PlaneGeometry(0.297,0.210),
+    new THREE.MeshBasicMaterial({color:0xff0000, transparent:true, opacity:0.2})
+  );
+  a4.rotation.x = -Math.PI/2; a4.visible=false; scene.add(a4);
+
+  // ---------- AR state ----------
+  let session=null, refSpace=null, hitTestSource=null, started=false;
+  let mode='idle'; // 'idle' | 'calib' | 'place'
+  let placeType='box'; // 'box' | 'obj'
+  let p1=null, p2=null;
+  let placed=null; // THREE.Object3D
+  let objText=null; // string content of OBJ
+
+  // ---------- start AR ----------
+  btnStart.onclick = async ()=>{
+    if (!navigator.xr){ toast('Браузер не поддерживает WebXR'); return; }
+    if (started) { toast('AR уже запущен'); return; }
+    try{
+      const ok = await navigator.xr.isSessionSupported('immersive-ar');
+      if (!ok){ toast('Этот девайс/браузер без AR WebXR'); return; }
+      session = await navigator.xr.requestSession('immersive-ar', {
+        requiredFeatures:['hit-test'],
+        optionalFeatures:['local-floor']
+      });
+    }catch(e){
+      console.error(e);
+      toast('Не удалось запустить AR: '+(e.message||e.name));
+      return;
+    }
+    renderer.xr.setReferenceSpaceType('local-floor');
+    await renderer.xr.setSession(session);
+    refSpace = renderer.xr.getReferenceSpace();
+    const viewerSpace = await session.requestReferenceSpace('viewer');
+    hitTestSource = await session.requestHitTestSource({space: viewerSpace});
+    session.addEventListener('end', ()=>{ started=false; reticle.visible=false; a4.visible=false; mode='idle'; setHint('Сессия завершена'); });
+    setHint('AR запущен. Масштаб '+getScale().toFixed(3)+'. Калибруй A4 или ставь объект.');
+    started=true;
+
+    // single touch handler (only once)
+    renderer.domElement.addEventListener('touchstart', onTouch, {passive:true});
+
+    renderer.setAnimationLoop((time, frame)=>{
+      if (!frame){ renderer.render(scene,camera); return; }
+      if (hitTestSource){
+        const hits = frame.getHitTestResults(hitTestSource);
+        if (hits.length){
+          const pose = hits[0].getPose(refSpace);
+          reticle.visible=true;
+          reticle.matrix.fromArray(pose.transform.matrix);
+          if (a4.visible){
+            a4.position.setFromMatrixPosition(reticle.matrix);
+          }
+        }else{
+          reticle.visible=false;
+        }
+      }
+      renderer.render(scene,camera);
+    });
+  };
+
+  function onTouch(e){
+    if (e.touches.length>1) return;
+    if (!reticle.visible) return;
+    const pos = new THREE.Vector3().setFromMatrixPosition(reticle.matrix);
+    if (mode==='calib'){
+      if (!p1){ p1=pos.clone(); toast('Первая точка. Поставь вторую вдоль длинной стороны A4 (297 мм).'); }
+      else if(!p2){ p2=pos.clone(); finishCalib(); }
+    } else if (mode==='place'){
+      doPlaceAt(pos);
+    }
+  }
+
+  // ---------- calibration ----------
+  btnCalib.onclick = ()=>{
+    if (!started){ toast('Сначала запусти AR'); return; }
+    mode='calib'; p1=null; p2=null; a4.visible=true;
+    setHint('Калибровка: 2 тапа вдоль длинной стороны листа A4 (297 мм).');
+  };
+  function finishCalib(){
+    const measured = p1.distanceTo(p2); const A4_LONG=0.297;
+    if (measured<1e-4){ toast('Слишком близко. Повтори.'); p1=null; p2=null; return; }
+    const k = A4_LONG/measured; setScale(k);
+    mode='idle'; a4.visible=false;
+    setHint('Масштаб '+k.toFixed(3)+'. Теперь ставь объект.');
+  }
+
+  // ---------- place box ----------
+  btnPlaceBox.onclick = ()=>{
+    if (!started){ toast('Сначала запусти AR'); return; }
+    placeType='box'; mode='place'; setHint('Тап по плоскости — поставить/перенести коробку.');
+  };
+
+  // ---------- import OBJ ----------
+  btnImportOBJ.onclick = ()=> fileOBJ.click();
+  fileOBJ.onchange = (e)=>{
+    const f = e.target.files && e.target.files[0];
+    if (!f){ toast('Файл не выбран'); return; }
+    if (!f.name.toLowerCase().endsWith('.obj')){ toast('Выбери .obj'); return; }
+    const r = new FileReader();
+    r.onload = ()=>{ objText = r.result; toast('OBJ загружен. Жми «Разместить OBJ», затем тап по плоскости.'); };
+    r.onerror = ()=> toast('Ошибка чтения OBJ');
+    r.readAsText(f);
+  };
+  btnPlaceOBJ.onclick = ()=>{
+    if (!started){ toast('Сначала запусти AR'); return; }
+    if (!objText){ toast('Сначала импортируй OBJ'); return; }
+    placeType='obj'; mode='place'; setHint('Тап по плоскости — разместить OBJ.');
+  };
+
+  function doPlaceAt(pos){
+    const scale=getScale();
+    if (placeType==='box'){
+      if (!placed || placed.userData.kind!=='box'){
+        if (placed) scene.remove(placed);
+        placed = new THREE.Mesh(
+          new THREE.BoxGeometry(1,1,1),
+          new THREE.MeshStandardMaterial({color:0x3399ff, metalness:0.1, roughness:0.7})
+        );
+        placed.userData.kind='box';
+        scene.add(placed);
+      }
+      placed.position.copy(pos);
+      placed.scale.setScalar(scale);
+      placed.visible=true;
+      toast('Коробка размещена.');
+    } else if (placeType==='obj'){
+      try{
+        const loader = new THREE.OBJLoader();
+        const obj = loader.parse(objText);
+        obj.traverse(o=>{
+          if (o.isMesh){
+            if (!o.material) o.material = new THREE.MeshStandardMaterial({color:0xcccccc, metalness:0.0, roughness:0.9});
+            o.castShadow=o.receiveShadow=true;
+          }
+        });
+        // center to ground
+        const bbox = new THREE.Box3().setFromObject(obj);
+        const size = new THREE.Vector3(); bbox.getSize(size);
+        const center = new THREE.Vector3(); bbox.getCenter(center);
+        obj.position.sub(center);
+        obj.position.y += size.y/2;
+
+        if (placed) scene.remove(placed);
+        placed = obj; placed.userData.kind='obj';
+        scene.add(placed);
+        placed.position.copy(pos);
+        placed.scale.setScalar(scale);
+        placed.visible=true;
+        toast('OBJ размещён.');
+      }catch(err){
+        console.error(err); toast('Не удалось распарсить OBJ');
+      }
+    }
+  }
+
+  // ---------- reset ----------
+  btnReset.onclick = ()=>{ setScale(1); toast('Масштаб 1.000'); };
+
+  // ---------- resize ----------
+  window.addEventListener('resize', ()=>{
+    renderer.setSize(window.innerWidth, window.innerHeight);
+  });
+})();
+</script>
+</body>
+</html>
