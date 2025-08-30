@@ -1,0 +1,264 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1, user-scalable=no"/>
+<title>AR MVP — Gestures (без кнопок в AR)</title>
+<style>
+  html,body{margin:0;height:100%;overflow:hidden;background:#000;font-family:system-ui,Arial;}
+  .webgl{position:fixed; inset:0; z-index:0; display:block;}
+  #ui{position:fixed;left:0;right:0;bottom:0;padding:10px;display:flex;gap:8px;flex-wrap:wrap;justify-content:center;
+      background:rgba(0,0,0,.9); z-index:1000;}
+  #ui button,#ui input{font-size:14px;padding:10px 12px;border-radius:10px;border:0}
+  #ui button{background:#fff; cursor:pointer;}
+  #toast{position:fixed;top:12px;left:50%;transform:translateX(-50%);background:rgba(0,0,0,.85);color:#fff;
+         padding:8px 12px;border-radius:10px;font-size:14px;display:none; z-index:1000; max-width:90vw; text-align:center;}
+  #hint{position:fixed;top:52px;left:50%;transform:translateX(-50%);background:rgba(20,20,20,.9);color:#fff;
+        padding:6px 10px;border-radius:8px;font-size:13px; z-index:1000; max-width:90vw; text-align:center;}
+</style>
+</head>
+<body>
+<div id="toast"></div>
+<div id="hint">Шаги: 1) Запусти AR  2) (опц.) Калибровка: двойной палец  3) Тап — поставить. Долгое нажатие — переключить Box↔OBJ.</div>
+
+<div id="ui">
+  <button id="start">Запустить AR</button>
+  <button id="importOBJ">Импорт OBJ</button>
+  <input type="file" id="fileOBJ" accept=".obj" style="display:none"/>
+  <button id="reset">Сброс масштаба</button>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/three@0.160/build/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.160/examples/js/loaders/OBJLoader.js"></script>
+
+<script>
+(async function(){
+  const toastBox = document.getElementById('toast');
+  const hint = document.getElementById('hint');
+  const toast = (msg, ms=2200)=>{ toastBox.textContent=msg; toastBox.style.display='block'; clearTimeout(toastBox._t); toastBox._t=setTimeout(()=>toastBox.style.display='none', ms); };
+  const setHint = (msg)=>{ hint.textContent = msg; };
+
+  const SCALE_KEY='ar_gestures_scale';
+  const getScale=()=> parseFloat(localStorage.getItem(SCALE_KEY)||'1')||1;
+  const setScale=(v)=>{ localStorage.setItem(SCALE_KEY, String(Math.max(1e-4,v))); toast('Масштаб: '+Number(v).toFixed(3)); };
+
+  const btnStart = document.getElementById('start');
+  const btnImportOBJ = document.getElementById('importOBJ');
+  const fileOBJ = document.getElementById('fileOBJ');
+  const btnReset = document.getElementById('reset');
+
+  // three.js core
+  const scene = new THREE.Scene();
+  const camera = new THREE.PerspectiveCamera();
+  const renderer = new THREE.WebGLRenderer({antialias:true, alpha:true});
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.setPixelRatio(Math.min(2, window.devicePixelRatio||1));
+  renderer.xr.enabled = true;
+  renderer.domElement.className='webgl';
+  document.body.insertBefore(renderer.domElement, document.body.firstChild);
+
+  scene.add(new THREE.HemisphereLight(0xffffff, 0x444444, 1.0));
+  const dir = new THREE.DirectionalLight(0xffffff, 0.6); dir.position.set(1,2,1); scene.add(dir);
+
+  const reticle = new THREE.Mesh(
+    new THREE.RingGeometry(0.06,0.065,48).rotateX(-Math.PI/2),
+    new THREE.MeshBasicMaterial({color:0x00ffcc, transparent:true, opacity:0.9})
+  );
+  reticle.matrixAutoUpdate=false; reticle.visible=false; scene.add(reticle);
+
+  // A4 helper plane for calibration mode (shows where тыкаешь)
+  const a4 = new THREE.Mesh(
+    new THREE.PlaneGeometry(0.297,0.210),
+    new THREE.MeshBasicMaterial({color:0xff0000, transparent:true, opacity:0.22})
+  );
+  a4.rotation.x = -Math.PI/2; a4.visible=false; scene.add(a4);
+
+  // state
+  let session=null, refSpace=null, hitTestSource=null, started=false;
+  let mode='place'; // default so single tap places immediately
+  let placeType='box'; // 'box' | 'obj'
+  let p1=null, p2=null;
+  let placed=null;
+  let objText=null;
+
+  // gestures state
+  let touchStartTime=0, touchMoved=false, longPressTimer=null;
+
+  // import OBJ
+  btnImportOBJ.onclick = ()=> fileOBJ.click();
+  fileOBJ.onchange = (e)=>{
+    const f = e.target.files && e.target.files[0];
+    if (!f){ toast('Файл не выбран'); return; }
+    if (!f.name.toLowerCase().endsWith('.obj')){ toast('Выбери .obj'); return; }
+    const r = new FileReader();
+    r.onload = ()=>{ objText = r.result; toast('OBJ загружен. Долгое нажатие в AR переключит Box↔OBJ.'); };
+    r.onerror = ()=> toast('Ошибка чтения OBJ');
+    r.readAsText(f);
+  };
+
+  // start AR
+  btnStart.onclick = async ()=>{
+    if (!navigator.xr){ toast('WebXR не поддерживается'); return; }
+    if (started){ toast('AR уже запущен'); return; }
+    try{
+      const ok = await navigator.xr.isSessionSupported('immersive-ar');
+      if (!ok){ toast('Девайс/браузер без WebXR AR'); return; }
+      session = await navigator.xr.requestSession('immersive-ar', {
+        requiredFeatures:['hit-test'],
+        optionalFeatures:['local-floor','dom-overlay'],
+        domOverlay: { root: document.body } // если поддерживается — UI останется
+      });
+    }catch(e){
+      console.error(e); toast('Не удалось запустить AR: '+(e.message||e.name)); return;
+    }
+    renderer.xr.setReferenceSpaceType('local-floor');
+    await renderer.xr.setSession(session);
+    refSpace = renderer.xr.getReferenceSpace();
+    const viewerSpace = await session.requestReferenceSpace('viewer');
+    hitTestSource = await session.requestHitTestSource({space: viewerSpace});
+    started=true;
+    setHint('AR запущен. Жесты: один палец — поставить, ДВА пальца — калибровка A4, долгое — Box↔OBJ.');
+
+    session.addEventListener('end', ()=>{
+      started=false; reticle.visible=false; a4.visible=false; mode='place'; setHint('Сессия завершена');
+      cancelLongPress();
+    });
+
+    // gesture listeners (added once)
+    renderer.domElement.addEventListener('touchstart', onTouchStart, {passive:true});
+    renderer.domElement.addEventListener('touchend', onTouchEnd, {passive:true});
+    renderer.domElement.addEventListener('touchmove', onTouchMove, {passive:true});
+
+    renderer.setAnimationLoop((time, frame)=>{
+      if (!frame){ renderer.render(scene,camera); return; }
+      if (hitTestSource){
+        const hits = frame.getHitTestResults(hitTestSource);
+        if (hits.length){
+          const pose = hits[0].getPose(refSpace);
+          reticle.visible=true;
+          reticle.matrix.fromArray(pose.transform.matrix);
+          if (a4.visible){
+            a4.position.setFromMatrixPosition(reticle.matrix);
+          }
+        }else{
+          reticle.visible=false;
+        }
+      }
+      renderer.render(scene,camera);
+    });
+  };
+
+  function onTouchStart(e){
+    if (!started) return;
+    touchMoved=false;
+    touchStartTime = performance.now();
+    if (e.touches.length===2){
+      // toggle calibration mode
+      if (mode!=='calib'){
+        mode='calib'; p1=null; p2=null; a4.visible=true; toast('Калибровка A4: поставь две точки вдоль 297 мм');
+      } else {
+        mode='place'; a4.visible=false; toast('Калибровка отменена');
+      }
+      cancelLongPress();
+      return;
+    }
+    if (e.touches.length===1){
+      // start long-press timer to toggle box/obj
+      cancelLongPress();
+      longPressTimer = setTimeout(()=>{
+        if (objText){
+          placeType = (placeType==='box') ? 'obj' : 'box';
+          toast('Режим: '+(placeType==='box'?'BOX':'OBJ'));
+        }else{
+          toast('OBJ ещё не импортирован');
+        }
+      }, 650);
+    }
+  }
+
+  function onTouchMove(e){
+    if (!started) return;
+    if (e.touches.length>=1) touchMoved=true;
+  }
+  function cancelLongPress(){ if (longPressTimer){ clearTimeout(longPressTimer); longPressTimer=null; } }
+
+  function onTouchEnd(e){
+    if (!started) return;
+    const dur = performance.now() - touchStartTime;
+    // if long-press fired, don't treat as tap
+    if (dur>=650){ cancelLongPress(); return; }
+    cancelLongPress();
+    if (touchMoved) return;
+    if (!reticle.visible) return;
+    const pos = new THREE.Vector3().setFromMatrixPosition(reticle.matrix);
+    if (mode==='calib'){
+      if (!p1){ p1=pos.clone(); toast('Первая точка принята'); }
+      else if (!p2){ p2=pos.clone(); finishCalib(); }
+    } else {
+      doPlaceAt(pos);
+    }
+  }
+
+  function finishCalib(){
+    const A4_LONG=0.297;
+    const measured = p1.distanceTo(p2);
+    if (measured<1e-4){ toast('Слишком близко. Повтори.'); p1=null; p2=null; return; }
+    const k = A4_LONG/measured;
+    setScale(k);
+    mode='place'; a4.visible=false;
+    toast('Масштаб обновлён. Однопальцевый тап — поставить.');
+  }
+
+  function doPlaceAt(pos){
+    const scale=getScale();
+    if (placeType==='box' || !objText){
+      if (!placed || placed.userData.kind!=='box'){
+        if (placed) scene.remove(placed);
+        placed = new THREE.Mesh(
+          new THREE.BoxGeometry(1,1,1),
+          new THREE.MeshStandardMaterial({color:0x3399ff, metalness:0.1, roughness:0.7})
+        );
+        placed.userData.kind='box';
+        scene.add(placed);
+      }
+      placed.position.copy(pos);
+      placed.scale.setScalar(scale);
+      placed.visible=true;
+    } else {
+      try{
+        const loader = new THREE.OBJLoader();
+        const obj = loader.parse(objText);
+        obj.traverse(o=>{
+          if (o.isMesh){
+            if (!o.material) o.material = new THREE.MeshStandardMaterial({color:0xcccccc, metalness:0.0, roughness:0.9});
+            o.castShadow=o.receiveShadow=true;
+          }
+        });
+        // center to ground
+        const bbox = new THREE.Box3().setFromObject(obj);
+        const size = new THREE.Vector3(); bbox.getSize(size);
+        const center = new THREE.Vector3(); bbox.getCenter(center);
+        obj.position.sub(center);
+        obj.position.y += size.y/2;
+
+        if (placed) scene.remove(placed);
+        placed = obj; placed.userData.kind='obj';
+        scene.add(placed);
+        placed.position.copy(pos);
+        placed.scale.setScalar(scale);
+        placed.visible=true;
+      }catch(err){
+        console.error(err); toast('Ошибка OBJ');
+      }
+    }
+  }
+
+  btnReset.onclick = ()=>{ setScale(1); toast('Масштаб 1.000'); };
+
+  window.addEventListener('resize', ()=>{
+    renderer.setSize(window.innerWidth, window.innerHeight);
+  });
+})();
+</script>
+</body>
+</html>
